@@ -63,45 +63,127 @@ function buildMockItems(): ParsedFoodItem[] {
 }
 
 async function ensureAuthenticatedUserId() {
-  const { data: userData, error: userErr } = await supabase.auth.getUser();
-  if (userErr) throw userErr;
-  if (userData.user) return userData.user.id;
+  try {
+    const { data: userData, error: userErr } = await supabase.auth.getUser();
+    
+    if (userErr) {
+      console.warn("Error getting current user:", userErr);
+    }
+    
+    if (userData.user?.id) {
+      console.log("Using authenticated user:", userData.user.id);
+      return userData.user.id;
+    }
 
-  const { data: anonData, error: anonErr } =
-    await supabase.auth.signInAnonymously();
-  if (anonErr) throw anonErr;
-  if (!anonData.user) {
-    throw new Error("Anonymous auth did not return a user.");
+    console.log("No authenticated user, attempting anonymous sign-in...");
+    const { data: anonData, error: anonErr } =
+      await supabase.auth.signInAnonymously();
+    
+    if (anonErr) {
+      throw new Error(
+        `Anonymous auth failed: ${anonErr.message}. Make sure authentication is enabled in Supabase.`
+      );
+    }
+    
+    if (!anonData.user?.id) {
+      throw new Error("Anonymous auth did not return a valid user ID");
+    }
+
+    console.log("Signed in anonymously:", anonData.user.id);
+    return anonData.user.id;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Authentication failed";
+    throw new Error(`User authentication error: ${message}`);
   }
-  return anonData.user.id;
 }
 
 async function uploadPhotoToSupabase(
   userId: string,
   imageUri: string
 ): Promise<string> {
-  const extension = imageUri.split(".").pop() || "jpg";
-  const filePath = `${userId}/${Date.now()}.${extension}`;
-  const fileBlob = await fetch(imageUri).then((res) => res.blob());
+  try {
+    // Extract file extension from URI
+    const uriParts = imageUri.split('.');
+    const extension = uriParts[uriParts.length - 1] || "jpg";
+    const filePath = `${userId}/${Date.now()}.${extension}`;
 
-  const { error: uploadError } = await supabase.storage
-    .from(SCAN_BUCKET)
-    .upload(filePath, fileBlob, {
-      contentType: "image/jpeg",
-      upsert: false,
-    });
+    let fileBlob: Blob;
 
-  if (uploadError) throw uploadError;
+    try {
+      // Try standard fetch first (works on web and some native platforms)
+      const response = await fetch(imageUri);
+      fileBlob = await response.blob();
+    } catch (fetchErr) {
+      // If fetch fails, try reading as base64 for mobile platforms
+      console.warn("Standard fetch failed, trying base64 conversion:", fetchErr);
+      
+      try {
+        // For expo native, we may need to read the file differently
+        const base64Data = await new Promise<string>((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.onload = () => {
+            const arr = new Uint8Array(xhr.response).reduce(
+              (data, byte) => data + String.fromCharCode(byte),
+              ""
+            );
+            resolve(btoa(arr));
+          };
+          xhr.onerror = reject;
+          xhr.open("GET", imageUri);
+          xhr.responseType = "arraybuffer";
+          xhr.send();
+        });
 
-  const { data: publicUrlData } = supabase.storage
-    .from(SCAN_BUCKET)
-    .getPublicUrl(filePath);
+        const binaryString = atob(base64Data);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+        fileBlob = new Blob([bytes], { type: "image/jpeg" });
+      } catch (base64Err) {
+        throw new Error(
+          `Failed to convert image: ${base64Err instanceof Error ? base64Err.message : "unknown error"}`
+        );
+      }
+    }
 
-  if (!publicUrlData.publicUrl) {
-    throw new Error("Failed to build public image URL.");
+    if (!fileBlob || fileBlob.size === 0) {
+      throw new Error("Image conversion resulted in empty blob");
+    }
+
+    console.log(`Uploading image: ${filePath} (${fileBlob.size} bytes)`);
+
+    const { data: uploadData, error: uploadError } = await supabase.storage
+      .from(SCAN_BUCKET)
+      .upload(filePath, fileBlob, {
+        contentType: "image/jpeg",
+        upsert: false,
+      });
+
+    if (uploadError) {
+      throw new Error(
+        `Storage upload failed: ${uploadError.message}. Make sure the meal-photos bucket exists and storage.sql has been run.`
+      );
+    }
+
+    if (!uploadData) {
+      throw new Error("Upload returned no data");
+    }
+
+    const { data: publicUrlData } = supabase.storage
+      .from(SCAN_BUCKET)
+      .getPublicUrl(filePath);
+
+    if (!publicUrlData.publicUrl) {
+      throw new Error("Failed to generate public image URL");
+    }
+
+    console.log(`Image uploaded successfully: ${publicUrlData.publicUrl}`);
+    return publicUrlData.publicUrl;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Image upload failed";
+    throw new Error(`Photo upload error: ${message}`);
   }
-
-  return publicUrlData.publicUrl;
 }
 
 async function parseImageWithApiOrMock(
@@ -188,12 +270,27 @@ async function saveMealAndItems(
 }
 
 export async function runFoodScan(imageUri: string): Promise<ScanResult> {
-  const userId = await ensureAuthenticatedUserId();
-  const photoUrl = await uploadPhotoToSupabase(userId, imageUri);
-  const items = await parseImageWithApiOrMock(photoUrl);
-  const mealId = await saveMealAndItems(userId, photoUrl, items);
+  try {
+    console.log("Starting food scan with image:", imageUri);
+    
+    const userId = await ensureAuthenticatedUserId();
+    console.log("User ID:", userId);
+    
+    const photoUrl = await uploadPhotoToSupabase(userId, imageUri);
+    console.log("Photo uploaded to:", photoUrl);
+    
+    const items = await parseImageWithApiOrMock(photoUrl);
+    console.log("Parsed items:", items.length);
+    
+    const mealId = await saveMealAndItems(userId, photoUrl, items);
+    console.log("Saved meal with ID:", mealId);
 
-  return { mealId, photoUrl, items };
+    return { mealId, photoUrl, items };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    console.error("Food scan failed:", message);
+    throw new Error(`Food scan failed: ${message}`);
+  }
 }
 
 export async function fetchRecentScans(limit = 8) {

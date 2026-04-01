@@ -41,22 +41,36 @@ export function ScanScreen() {
   const processImage = async (uri: string) => {
     try {
       setIsSubmitting(true);
-      setStatus("Uploading photo and scanning...");
+      setStatus("Processing your image...");
       setPreviewUri(uri);
 
       const result = await runFoodScan(uri);
       setStatus(
-        `Saved scan with ${result.items.length} item(s) into meal ${result.mealId.slice(
+        `✓ Scan complete! Found ${result.items.length} item(s) in meal ${result.mealId.slice(
           0,
           8
         )}...`
       );
 
-      await loadRecent();
+      // Reload recent scans after a short delay
+      setTimeout(() => {
+        loadRecent();
+      }, 500);
     } catch (err: unknown) {
       const message =
         err instanceof Error ? err.message : "Scan failed. Please try again.";
-      setStatus(message);
+      console.error("Scan error:", message);
+      
+      // Provide helpful error messages
+      let userMessage = message;
+      if (message.includes("storage")) {
+        userMessage += "\n\nMake sure storage.sql has been run in Supabase.";
+      }
+      if (message.includes("auth")) {
+        userMessage += "\n\nMake sure authentication is enabled in Supabase.";
+      }
+      
+      setStatus(userMessage);
     } finally {
       setIsSubmitting(false);
     }

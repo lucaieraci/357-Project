@@ -2,11 +2,13 @@ import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
 import { HistoryScreen } from "../screens/HistoryScreen";
 import { ProfileScreen } from "../screens/ProfileScreen";
 import { ScanScreen } from "../screens/ScanScreen";
+import { SleepNavigator } from "./SleepNavigator";
 
 type AuthContext = {
   onLogin: (email: string) => void;
   onLogout: () => void;
   userEmail: string;
+  userId?: string;
 };
 
 const Tab = createBottomTabNavigator();
@@ -33,6 +35,15 @@ export function MainTabs({ authContext }: MainTabsProps) {
         options={{ title: "Image Scan" }}
       />
       <Tab.Screen
+        name="Sleep"
+        options={{
+          title: "Sleep",
+          headerShown: false,
+        }}
+      >
+        {() => <SleepNavigator userId={authContext.userId} />}
+      </Tab.Screen>
+      <Tab.Screen
         name="History"
         component={HistoryScreen}
         options={{ title: "Nutrient History" }}
@@ -41,6 +52,7 @@ export function MainTabs({ authContext }: MainTabsProps) {
         {() => (
           <ProfileScreen
             userEmail={authContext.userEmail}
+            userId={authContext.userId}
             onLogout={authContext.onLogout}
           />
         )}
