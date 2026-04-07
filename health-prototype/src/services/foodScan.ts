@@ -1,3 +1,4 @@
+import * as FileSystem from "expo-file-system";
 import { supabase } from "../../supabase";
 
 export type ParsedFoodItem = {
@@ -8,6 +9,7 @@ export type ParsedFoodItem = {
   protein_g?: number;
   carbs_g?: number;
   fat_g?: number;
+  micros?: Record<string, number>;
 };
 
 export type ScanResult = {
@@ -18,17 +20,240 @@ export type ScanResult = {
 
 const SCAN_BUCKET = "meal-photos";
 
-type ApiFoodItem = {
-  name?: string;
-  food_name?: string;
-  grams?: number;
-  serving_grams?: number;
-  confidence?: number;
-  calories?: number;
-  protein_g?: number;
-  carbs_g?: number;
-  fat_g?: number;
+// ---------------------------------------------------------------------------
+// Auth
+// ---------------------------------------------------------------------------
+
+async function ensureAuthenticatedUserId(): Promise<string> {
+  const { data: userData, error: userErr } = await supabase.auth.getUser();
+  if (userErr) console.warn("Error getting current user:", userErr);
+
+  if (userData.user?.id) return userData.user.id;
+
+  const { data: anonData, error: anonErr } =
+    await supabase.auth.signInAnonymously();
+  if (anonErr)
+    throw new Error(
+      `Anonymous auth failed: ${anonErr.message}. Make sure authentication is enabled in Supabase.`
+    );
+  if (!anonData.user?.id)
+    throw new Error("Anonymous auth did not return a valid user ID");
+
+  return anonData.user.id;
+}
+
+// ---------------------------------------------------------------------------
+// Photo upload
+// ---------------------------------------------------------------------------
+
+async function uploadPhotoToSupabase(
+  userId: string,
+  imageUri: string
+): Promise<string> {
+  const uriParts = imageUri.split(".");
+  const extension = uriParts[uriParts.length - 1] || "jpg";
+  const filePath = `${userId}/${Date.now()}.${extension}`;
+
+  let fileBlob: Blob;
+  try {
+    const response = await fetch(imageUri);
+    fileBlob = await response.blob();
+  } catch {
+    // Fallback for platforms where fetch on a local URI fails
+    const base64 = await FileSystem.readAsStringAsync(imageUri, {
+      encoding: "base64",
+    });
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    fileBlob = new Blob([bytes], { type: "image/jpeg" });
+  }
+
+  if (!fileBlob || fileBlob.size === 0)
+    throw new Error("Image conversion resulted in empty blob");
+
+  const { data: uploadData, error: uploadError } = await supabase.storage
+    .from(SCAN_BUCKET)
+    .upload(filePath, fileBlob, { contentType: "image/jpeg", upsert: false });
+
+  if (uploadError)
+    throw new Error(
+      `Storage upload failed: ${uploadError.message}. Make sure the meal-photos bucket exists and storage.sql has been run.`
+    );
+  if (!uploadData) throw new Error("Upload returned no data");
+
+  const { data: publicUrlData } = supabase.storage
+    .from(SCAN_BUCKET)
+    .getPublicUrl(filePath);
+
+  if (!publicUrlData.publicUrl)
+    throw new Error("Failed to generate public image URL");
+
+  return publicUrlData.publicUrl;
+}
+
+// ---------------------------------------------------------------------------
+// Step 1: Claude Vision — identify foods + estimate portions
+// ---------------------------------------------------------------------------
+
+type ClaudeFoodItem = { name: string; grams: number; confidence: number };
+
+async function identifyFoodsWithClaude(
+  imageUri: string
+): Promise<ClaudeFoodItem[] | null> {
+  const apiKey = process.env.EXPO_PUBLIC_ANTHROPIC_API_KEY;
+  if (!apiKey) return null;
+
+  const base64 = await FileSystem.readAsStringAsync(imageUri, {
+    encoding: "base64",
+  });
+
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "image",
+              source: { type: "base64", media_type: "image/jpeg", data: base64 },
+            },
+            {
+              type: "text",
+              text: `Identify all food items visible in this meal photo. For each item, estimate the portion size in grams and your confidence (0–1).
+
+Return ONLY a valid JSON array — no markdown, no explanation:
+[{"name": "grilled chicken breast", "grams": 150, "confidence": 0.85}]
+
+Use specific food names suitable for a nutrition database lookup (e.g. "brown rice" not "rice", "steamed broccoli" not "vegetables"). If no food is visible, return [].`,
+            },
+          ],
+        },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Claude Vision API error: ${response.status}`);
+  }
+
+  const data = await response.json();
+  const text: string = data.content?.[0]?.text ?? "";
+
+  const match = text.match(/\[[\s\S]*\]/);
+  if (!match) return [];
+
+  try {
+    return JSON.parse(match[0]) as ClaudeFoodItem[];
+  } catch {
+    console.warn("Failed to parse Claude response as JSON:", text);
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Step 2: USDA FoodData Central — full nutrition per food item
+// ---------------------------------------------------------------------------
+
+// Nutrient numbers used by USDA (per 100 g in Foundation / SR Legacy data)
+const USDA_NUTRIENT_MAP: Record<string, string> = {
+  calories: "208",
+  protein_g: "203",
+  fat_g: "204",
+  carbs_g: "205",
+  fiber_g: "291",
+  sugar_g: "269",
+  vitamin_c_mg: "401",
+  vitamin_a_ug: "320",
+  vitamin_d_ug: "328",
+  vitamin_e_mg: "323",
+  vitamin_k_ug: "430",
+  thiamin_mg: "404",
+  riboflavin_mg: "405",
+  niacin_mg: "406",
+  vitamin_b6_mg: "415",
+  folate_ug: "431",
+  vitamin_b12_ug: "418",
+  calcium_mg: "301",
+  iron_mg: "303",
+  magnesium_mg: "304",
+  potassium_mg: "306",
+  sodium_mg: "307",
+  zinc_mg: "309",
 };
+
+type UsdaFoodNutrient = {
+  nutrientNumber: string;
+  value: number;
+};
+
+async function lookupNutritionFromUSDA(
+  foodName: string,
+  grams: number,
+  confidence: number
+): Promise<ParsedFoodItem> {
+  const apiKey = process.env.EXPO_PUBLIC_USDA_API_KEY ?? "DEMO_KEY";
+  const scale = grams / 100;
+
+  try {
+    const url =
+      `https://api.nal.usda.gov/fdc/v1/foods/search` +
+      `?query=${encodeURIComponent(foodName)}` +
+      `&dataType=Foundation,SR%20Legacy` +
+      `&pageSize=1` +
+      `&api_key=${apiKey}`;
+
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`USDA API ${response.status}`);
+
+    const data = await response.json();
+    const food = data.foods?.[0];
+
+    if (!food) {
+      console.warn(`USDA: no results for "${foodName}", using zeros`);
+      return { food_name: foodName, grams, confidence };
+    }
+
+    const nutrients: UsdaFoodNutrient[] = food.foodNutrients ?? [];
+    const get = (number: string): number | undefined => {
+      const n = nutrients.find((x) => x.nutrientNumber === number);
+      return n != null ? Math.round(n.value * scale * 100) / 100 : undefined;
+    };
+
+    const micros: Record<string, number> = {};
+    for (const [key, number] of Object.entries(USDA_NUTRIENT_MAP)) {
+      if (["calories", "protein_g", "fat_g", "carbs_g"].includes(key)) continue;
+      const val = get(number);
+      if (val != null && val > 0) micros[key] = val;
+    }
+
+    return {
+      food_name: foodName,
+      grams,
+      confidence,
+      calories: get(USDA_NUTRIENT_MAP.calories),
+      protein_g: get(USDA_NUTRIENT_MAP.protein_g),
+      carbs_g: get(USDA_NUTRIENT_MAP.carbs_g),
+      fat_g: get(USDA_NUTRIENT_MAP.fat_g),
+      micros,
+    };
+  } catch (err) {
+    console.warn(`USDA lookup failed for "${foodName}":`, err);
+    return { food_name: foodName, grams, confidence };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Mock fallback
+// ---------------------------------------------------------------------------
 
 function buildMockItems(): ParsedFoodItem[] {
   return [
@@ -40,6 +265,15 @@ function buildMockItems(): ParsedFoodItem[] {
       protein_g: 43.1,
       carbs_g: 0,
       fat_g: 5,
+      micros: {
+        vitamin_b6_mg: 1.16,
+        niacin_mg: 14.8,
+        potassium_mg: 448,
+        sodium_mg: 104,
+        iron_mg: 1.26,
+        magnesium_mg: 42,
+        zinc_mg: 2.66,
+      },
     },
     {
       food_name: "Brown rice",
@@ -49,6 +283,13 @@ function buildMockItems(): ParsedFoodItem[] {
       protein_g: 4.1,
       carbs_g: 36.8,
       fat_g: 1.4,
+      micros: {
+        fiber_g: 2.9,
+        thiamin_mg: 0.24,
+        magnesium_mg: 84,
+        potassium_mg: 130,
+        zinc_mg: 1.5,
+      },
     },
     {
       food_name: "Steamed broccoli",
@@ -58,181 +299,51 @@ function buildMockItems(): ParsedFoodItem[] {
       protein_g: 2.6,
       carbs_g: 6,
       fat_g: 0.3,
+      micros: {
+        fiber_g: 2.4,
+        vitamin_c_mg: 81,
+        vitamin_k_ug: 102,
+        folate_ug: 63,
+        calcium_mg: 47,
+        potassium_mg: 288,
+      },
     },
   ];
 }
 
-async function ensureAuthenticatedUserId() {
-  try {
-    const { data: userData, error: userErr } = await supabase.auth.getUser();
-    
-    if (userErr) {
-      console.warn("Error getting current user:", userErr);
-    }
-    
-    if (userData.user?.id) {
-      console.log("Using authenticated user:", userData.user.id);
-      return userData.user.id;
-    }
+// ---------------------------------------------------------------------------
+// Main pipeline
+// ---------------------------------------------------------------------------
 
-    console.log("No authenticated user, attempting anonymous sign-in...");
-    const { data: anonData, error: anonErr } =
-      await supabase.auth.signInAnonymously();
-    
-    if (anonErr) {
-      throw new Error(
-        `Anonymous auth failed: ${anonErr.message}. Make sure authentication is enabled in Supabase.`
-      );
-    }
-    
-    if (!anonData.user?.id) {
-      throw new Error("Anonymous auth did not return a valid user ID");
-    }
-
-    console.log("Signed in anonymously:", anonData.user.id);
-    return anonData.user.id;
-  } catch (err) {
-    const message = err instanceof Error ? err.message : "Authentication failed";
-    throw new Error(`User authentication error: ${message}`);
-  }
-}
-
-async function uploadPhotoToSupabase(
-  userId: string,
+async function parseImageToNutrition(
   imageUri: string
-): Promise<string> {
-  try {
-    // Extract file extension from URI
-    const uriParts = imageUri.split('.');
-    const extension = uriParts[uriParts.length - 1] || "jpg";
-    const filePath = `${userId}/${Date.now()}.${extension}`;
-
-    let fileBlob: Blob;
-
-    try {
-      // Try standard fetch first (works on web and some native platforms)
-      const response = await fetch(imageUri);
-      fileBlob = await response.blob();
-    } catch (fetchErr) {
-      // If fetch fails, try reading as base64 for mobile platforms
-      console.warn("Standard fetch failed, trying base64 conversion:", fetchErr);
-      
-      try {
-        // For expo native, we may need to read the file differently
-        const base64Data = await new Promise<string>((resolve, reject) => {
-          const xhr = new XMLHttpRequest();
-          xhr.onload = () => {
-            const arr = new Uint8Array(xhr.response).reduce(
-              (data, byte) => data + String.fromCharCode(byte),
-              ""
-            );
-            resolve(btoa(arr));
-          };
-          xhr.onerror = reject;
-          xhr.open("GET", imageUri);
-          xhr.responseType = "arraybuffer";
-          xhr.send();
-        });
-
-        const binaryString = atob(base64Data);
-        const bytes = new Uint8Array(binaryString.length);
-        for (let i = 0; i < binaryString.length; i++) {
-          bytes[i] = binaryString.charCodeAt(i);
-        }
-        fileBlob = new Blob([bytes], { type: "image/jpeg" });
-      } catch (base64Err) {
-        throw new Error(
-          `Failed to convert image: ${base64Err instanceof Error ? base64Err.message : "unknown error"}`
-        );
-      }
-    }
-
-    if (!fileBlob || fileBlob.size === 0) {
-      throw new Error("Image conversion resulted in empty blob");
-    }
-
-    console.log(`Uploading image: ${filePath} (${fileBlob.size} bytes)`);
-
-    const { data: uploadData, error: uploadError } = await supabase.storage
-      .from(SCAN_BUCKET)
-      .upload(filePath, fileBlob, {
-        contentType: "image/jpeg",
-        upsert: false,
-      });
-
-    if (uploadError) {
-      throw new Error(
-        `Storage upload failed: ${uploadError.message}. Make sure the meal-photos bucket exists and storage.sql has been run.`
-      );
-    }
-
-    if (!uploadData) {
-      throw new Error("Upload returned no data");
-    }
-
-    const { data: publicUrlData } = supabase.storage
-      .from(SCAN_BUCKET)
-      .getPublicUrl(filePath);
-
-    if (!publicUrlData.publicUrl) {
-      throw new Error("Failed to generate public image URL");
-    }
-
-    console.log(`Image uploaded successfully: ${publicUrlData.publicUrl}`);
-    return publicUrlData.publicUrl;
-  } catch (err) {
-    const message = err instanceof Error ? err.message : "Image upload failed";
-    throw new Error(`Photo upload error: ${message}`);
-  }
-}
-
-async function parseImageWithApiOrMock(
-  photoUrl: string
 ): Promise<ParsedFoodItem[]> {
-  const apiUrl = process.env.EXPO_PUBLIC_CALORIEMAMA_API_URL;
-  const apiKey = process.env.EXPO_PUBLIC_CALORIEMAMA_API_KEY;
+  const claudeItems = await identifyFoodsWithClaude(imageUri);
 
-  if (!apiUrl || !apiKey) {
+  if (!claudeItems) {
+    console.log("No Anthropic API key — using mock data");
     return buildMockItems();
   }
 
-  const response = await fetch(apiUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({ image_url: photoUrl }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Food scan API failed with status ${response.status}`);
+  if (claudeItems.length === 0) {
+    console.log("Claude found no food items in image");
+    return [];
   }
 
-  const data = await response.json();
-  const apiItems = (data.foods || data.items || []) as ApiFoodItem[];
+  console.log(`Claude identified ${claudeItems.length} food item(s), looking up USDA nutrition...`);
 
-  const normalized = apiItems
-    .map((item): ParsedFoodItem => {
-      const name = item.food_name || item.name || "Unknown food";
-      return {
-        food_name: name,
-        grams: item.grams ?? item.serving_grams,
-        confidence: item.confidence,
-        calories: item.calories,
-        protein_g: item.protein_g,
-        carbs_g: item.carbs_g,
-        fat_g: item.fat_g,
-      };
-    })
-    .filter((item) => item.food_name.trim().length > 0);
+  const results = await Promise.all(
+    claudeItems.map((item) =>
+      lookupNutritionFromUSDA(item.name, item.grams, item.confidence)
+    )
+  );
 
-  if (normalized.length === 0) {
-    return buildMockItems();
-  }
-
-  return normalized;
+  return results;
 }
+
+// ---------------------------------------------------------------------------
+// Save to Supabase
+// ---------------------------------------------------------------------------
 
 async function saveMealAndItems(
   userId: string,
@@ -241,11 +352,7 @@ async function saveMealAndItems(
 ): Promise<string> {
   const { data: meal, error: mealErr } = await supabase
     .from("meals")
-    .insert({
-      user_id: userId,
-      photo_url: photoUrl,
-      source: "photo_scan",
-    })
+    .insert({ user_id: userId, photo_url: photoUrl, source: "photo_scan" })
     .select("id")
     .single();
 
@@ -261,6 +368,7 @@ async function saveMealAndItems(
     protein_g: item.protein_g ?? null,
     carbs_g: item.carbs_g ?? null,
     fat_g: item.fat_g ?? null,
+    micros: item.micros ?? {},
   }));
 
   const { error: itemErr } = await supabase.from("meal_items").insert(rows);
@@ -269,28 +377,28 @@ async function saveMealAndItems(
   return meal.id;
 }
 
-export async function runFoodScan(imageUri: string): Promise<ScanResult> {
-  try {
-    console.log("Starting food scan with image:", imageUri);
-    
-    const userId = await ensureAuthenticatedUserId();
-    console.log("User ID:", userId);
-    
-    const photoUrl = await uploadPhotoToSupabase(userId, imageUri);
-    console.log("Photo uploaded to:", photoUrl);
-    
-    const items = await parseImageWithApiOrMock(photoUrl);
-    console.log("Parsed items:", items.length);
-    
-    const mealId = await saveMealAndItems(userId, photoUrl, items);
-    console.log("Saved meal with ID:", mealId);
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 
-    return { mealId, photoUrl, items };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : "Unknown error";
-    console.error("Food scan failed:", message);
-    throw new Error(`Food scan failed: ${message}`);
-  }
+export async function runFoodScan(imageUri: string): Promise<ScanResult> {
+  console.log("Starting food scan:", imageUri);
+
+  const userId = await ensureAuthenticatedUserId();
+  console.log("User ID:", userId);
+
+  // Run photo upload and food identification in parallel
+  const [photoUrl, items] = await Promise.all([
+    uploadPhotoToSupabase(userId, imageUri),
+    parseImageToNutrition(imageUri),
+  ]);
+
+  console.log(`Photo uploaded, ${items.length} item(s) identified`);
+
+  const mealId = await saveMealAndItems(userId, photoUrl, items);
+  console.log("Saved meal:", mealId);
+
+  return { mealId, photoUrl, items };
 }
 
 export async function fetchRecentScans(limit = 8) {
@@ -300,17 +408,21 @@ export async function fetchRecentScans(limit = 8) {
 
   const { data, error } = await supabase
     .from("meals")
-    .select("id, eaten_at, photo_url, meal_items(food_name, calories, confidence)")
+    .select(
+      "id, eaten_at, photo_url, meal_items(food_name, calories, confidence)"
+    )
     .order("eaten_at", { ascending: false })
     .limit(limit);
 
   if (error) throw error;
 
   return (data || []).map((meal) => {
-    const firstItem = Array.isArray(meal.meal_items) ? meal.meal_items[0] : null;
+    const firstItem = Array.isArray(meal.meal_items)
+      ? meal.meal_items[0]
+      : null;
     return {
       id: meal.id,
-      item: firstItem?.food_name || "Scanned meal",
+      item: firstItem?.food_name ?? "Scanned meal",
       calories: firstItem?.calories ?? 0,
       confidence: firstItem?.confidence ?? 0,
       eatenAt: meal.eaten_at,
