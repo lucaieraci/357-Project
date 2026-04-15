@@ -1,4 +1,5 @@
 import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
+import { Ionicons } from "@expo/vector-icons";
 import { HistoryScreen } from "../screens/HistoryScreen";
 import { ProfileScreen } from "../screens/ProfileScreen";
 import { ScanScreen } from "../screens/ScanScreen";
@@ -32,13 +33,21 @@ export function MainTabs({ authContext }: MainTabsProps) {
       <Tab.Screen
         name="Scan"
         component={ScanScreen}
-        options={{ title: "Image Scan" }}
+        options={{
+          title: "Image Scan",
+          tabBarIcon: ({ color, size }) => (
+            <Ionicons name="camera-outline" size={size} color={color} />
+          ),
+        }}
       />
       <Tab.Screen
         name="Sleep"
         options={{
           title: "Sleep",
           headerShown: false,
+          tabBarIcon: ({ color, size }) => (
+            <Ionicons name="moon-outline" size={size} color={color} />
+          ),
         }}
       >
         {() => <SleepNavigator userId={authContext.userId} />}
@@ -46,9 +55,21 @@ export function MainTabs({ authContext }: MainTabsProps) {
       <Tab.Screen
         name="History"
         component={HistoryScreen}
-        options={{ title: "Nutrient History" }}
+        options={{
+          title: "Nutrient History",
+          tabBarIcon: ({ color, size }) => (
+            <Ionicons name="bar-chart-outline" size={size} color={color} />
+          ),
+        }}
       />
-      <Tab.Screen name="Profile">
+      <Tab.Screen
+        name="Profile"
+        options={{
+          tabBarIcon: ({ color, size }) => (
+            <Ionicons name="person-outline" size={size} color={color} />
+          ),
+        }}
+      >
         {() => (
           <ProfileScreen
             userEmail={authContext.userEmail}
