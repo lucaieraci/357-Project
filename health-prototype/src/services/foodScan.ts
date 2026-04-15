@@ -1,4 +1,4 @@
-import * as FileSystem from "expo-file-system";
+import * as FileSystem from "expo-file-system/legacy";
 import { supabase } from "../../supabase";
 
 export type ParsedFoodItem = {
@@ -400,6 +400,70 @@ export async function runFoodScan(imageUri: string): Promise<ScanResult> {
 
   return { mealId, photoUrl, items };
 }
+
+// ---------------------------------------------------------------------------
+// Fetch full items for a single meal
+// ---------------------------------------------------------------------------
+
+export async function fetchMealItems(mealId: string): Promise<ParsedFoodItem[]> {
+  const { data, error } = await supabase
+    .from("meal_items")
+    .select("food_name, grams, confidence, calories, protein_g, carbs_g, fat_g, micros")
+    .eq("meal_id", mealId);
+  if (error) throw error;
+  return (data ?? []) as ParsedFoodItem[];
+}
+
+// ---------------------------------------------------------------------------
+// Sum today's macros across all meals
+// ---------------------------------------------------------------------------
+
+export type MacroTotals = {
+  calories: number;
+  protein_g: number;
+  carbs_g: number;
+  fat_g: number;
+};
+
+export async function fetchTodaysMacros(): Promise<MacroTotals> {
+  const zero: MacroTotals = { calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0 };
+
+  const { data: userData } = await supabase.auth.getUser();
+  if (!userData.user) return zero;
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const tomorrow = new Date(today);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+
+  const { data: meals } = await supabase
+    .from("meals")
+    .select("id")
+    .eq("user_id", userData.user.id)
+    .gte("eaten_at", today.toISOString())
+    .lt("eaten_at", tomorrow.toISOString());
+
+  if (!meals?.length) return zero;
+
+  const { data: items } = await supabase
+    .from("meal_items")
+    .select("calories, protein_g, carbs_g, fat_g")
+    .in("meal_id", meals.map((m) => m.id));
+
+  if (!items?.length) return zero;
+
+  return items.reduce(
+    (acc, item) => ({
+      calories: Math.round(acc.calories + (item.calories ?? 0)),
+      protein_g: Math.round((acc.protein_g + (item.protein_g ?? 0)) * 10) / 10,
+      carbs_g: Math.round((acc.carbs_g + (item.carbs_g ?? 0)) * 10) / 10,
+      fat_g: Math.round((acc.fat_g + (item.fat_g ?? 0)) * 10) / 10,
+    }),
+    zero
+  );
+}
+
+// ---------------------------------------------------------------------------
 
 export async function fetchRecentScans(limit = 8) {
   const { data: userData, error: userErr } = await supabase.auth.getUser();
